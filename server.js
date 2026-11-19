@@ -1,8 +1,7 @@
 'use strict';
 const path = require('path');
-const fs = require('fs');
 const express = require('express');
-const Database = require('better-sqlite3');
+const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const cookieParser = require('cookie-parser');
@@ -12,21 +11,12 @@ const PROD = process.env.NODE_ENV === 'production';
 const PORT = process.env.PORT || 3000;
 const SECRET = process.env.JWT_SECRET || (PROD ? null : 'dev-only-secret');
 if (!SECRET) { console.error('JWT_SECRET must be set in production.'); process.exit(1); }
-const DB_FILE = process.env.DB_PATH || path.join(__dirname, 'data', 'hayati.db');
-fs.mkdirSync(path.dirname(DB_FILE), { recursive: true });
+if (!process.env.DATABASE_URL) { console.error('DATABASE_URL is not set. Paste your Neon (PostgreSQL) connection string into it.'); process.exit(1); }
 
-/* ---------- Database ---------- */
-const db = new Database(DB_FILE);
-db.pragma('journal_mode = WAL');
-db.pragma('foreign_keys = ON');
-
-db.exec(`CREATE TABLE IF NOT EXISTS users (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  email TEXT NOT NULL UNIQUE,
-  name TEXT NOT NULL,
-  pass TEXT NOT NULL,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-)`);
+/* ---------- Database (PostgreSQL) ---------- */
+const pool = new Pool({ connectionString: process.env.DATABASE_URL, max: 5 });
+pool.on('error', e => console.error('Database connection error:', e.message));
+const q = (text, params) => pool.query(text, params);
 
 // One table per feature. Column names match the front-end fields exactly.
 const SCHEMA = {
@@ -37,13 +27,23 @@ const SCHEMA = {
   routines: { name: 'text', when: 'text', doneOn: 'text' },
   tx:       { type: 'text', cat: 'text', amt: 'num', date: 'text' }
 };
-const SQLTYPE = { text: "TEXT NOT NULL DEFAULT ''", num: 'REAL NOT NULL DEFAULT 0', bool: 'INTEGER NOT NULL DEFAULT 0' };
-for (const [t, cols] of Object.entries(SCHEMA)) {
-  const defs = Object.entries(cols).map(([c, k]) => `"${c}" ${SQLTYPE[k]}`).join(', ');
-  db.exec(`CREATE TABLE IF NOT EXISTS "${t}" (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    uid INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, ${defs});
-    CREATE INDEX IF NOT EXISTS "idx_${t}_uid" ON "${t}"(uid);`);
+const SQLTYPE = { text: "TEXT NOT NULL DEFAULT ''", num: 'DOUBLE PRECISION NOT NULL DEFAULT 0', bool: 'BOOLEAN NOT NULL DEFAULT FALSE' };
+
+async function initDb() {
+  await q(`CREATE TABLE IF NOT EXISTS users (
+    id SERIAL PRIMARY KEY,
+    email TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    pass TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  )`);
+  for (const [t, cols] of Object.entries(SCHEMA)) {
+    const defs = Object.entries(cols).map(([c, k]) => `"${c}" ${SQLTYPE[k]}`).join(', ');
+    await q(`CREATE TABLE IF NOT EXISTS "${t}" (
+      id SERIAL PRIMARY KEY,
+      uid INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, ${defs})`);
+    await q(`CREATE INDEX IF NOT EXISTS "idx_${t}_uid" ON "${t}"(uid)`);
+  }
 }
 
 /* ---------- Helpers ---------- */
@@ -59,19 +59,15 @@ function clean(store, body, partial) {
     const v = body[c];
     if (kind === 'text' && typeof v === 'string' && v.length <= 500) out[c] = v;
     else if (kind === 'num' && typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= 1e12) out[c] = v;
-    else if (kind === 'bool' && typeof v === 'boolean') out[c] = v ? 1 : 0;
+    else if (kind === 'bool' && typeof v === 'boolean') out[c] = v;
     else throw httpErr(400, `Invalid value for "${c}".`);
   }
   if (!partial && !Object.keys(out).length) throw httpErr(400, 'Nothing to save.');
   return out;
 }
-function toClient(store, row) {
-  for (const [c, kind] of Object.entries(SCHEMA[store])) if (kind === 'bool') row[c] = !!row[c];
-  return row;
-}
 const rowId = req => {
   const id = Number(req.params.id);
-  if (!Number.isInteger(id)) throw httpErr(404, 'Not found.');
+  if (!Number.isInteger(id) || id < 1 || id > 2147483646) throw httpErr(404, 'Not found.');
   return id;
 };
 
@@ -92,7 +88,7 @@ const DUMMY_HASH = bcrypt.hashSync('not-a-real-password', 10);
 const EMAIL = /^\S+@\S+\.\S+$/;
 
 const setSession = (res, uid) =>
-  res.cookie(COOKIE, jwt.sign({ uid }, SECRET, { expiresIn: '7d' }), { ...COOKIE_OPTS, maxAge: 7 * 864e5 });
+  res.cookie(COOKIE, jwt.sign({ uid }, SECRET, { expiresIn: '30d' }), { ...COOKIE_OPTS, maxAge: 30 * 864e5 });
 const auth = (req, res, next) => {
   try { req.uid = jwt.verify(req.cookies[COOKIE] || '', SECRET, { algorithms: ['HS256'] }).uid; next(); }
   catch { next(httpErr(401, 'Please log in.')); }
@@ -116,19 +112,19 @@ app.post('/api/signup', authLimit, wrap(async (req, res) => {
   const hash = await bcrypt.hash(pw, 10);
   let id;
   try {
-    id = db.prepare('INSERT INTO users (email, name, pass) VALUES (?, ?, ?)').run(email, name, hash).lastInsertRowid;
+    id = (await q('INSERT INTO users (email, name, pass) VALUES ($1, $2, $3) RETURNING id', [email, name, hash])).rows[0].id;
   } catch (e) {
-    if (String(e.code).startsWith('SQLITE_CONSTRAINT')) throw httpErr(409, 'That email already has an account. Log in instead.');
+    if (e.code === '23505') throw httpErr(409, 'That email already has an account. Log in instead.');
     throw e;
   }
-  setSession(res, Number(id));
+  setSession(res, id);
   res.status(201).json({ email, name });
 }));
 
 app.post('/api/login', authLimit, wrap(async (req, res) => {
   const email = String(req.body.email || '').trim().toLowerCase();
   const pw = String(req.body.password || '');
-  const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
+  const user = (await q('SELECT * FROM users WHERE email = $1', [email])).rows[0];
   const ok = await bcrypt.compare(pw, user ? user.pass : DUMMY_HASH);
   if (!user || !ok) throw httpErr(401, 'Invalid email or password.');
   setSession(res, user.id);
@@ -137,11 +133,11 @@ app.post('/api/login', authLimit, wrap(async (req, res) => {
 
 app.post('/api/logout', (req, res) => { res.clearCookie(COOKIE, COOKIE_OPTS); res.json({ ok: true }); });
 
-app.get('/api/me', auth, (req, res) => {
-  const user = db.prepare('SELECT email, name FROM users WHERE id = ?').get(req.uid);
+app.get('/api/me', auth, wrap(async (req, res) => {
+  const user = (await q('SELECT email, name FROM users WHERE id = $1', [req.uid])).rows[0];
   if (!user) throw httpErr(401, 'Please log in.');
   res.json(user);
-});
+}));
 
 /* ---------- Data API: /api/<store> ---------- */
 const api = express.Router();
@@ -149,41 +145,37 @@ api.use(auth);
 api.param('store', (req, res, next, store) =>
   Object.hasOwn(SCHEMA, store) ? next() : next(httpErr(404, 'Not found.')));
 
-api.get('/:store', (req, res) => {
-  const s = req.params.store;
-  res.json(db.prepare(`SELECT * FROM "${s}" WHERE uid = ? ORDER BY id`).all(req.uid).map(r => toClient(s, r)));
-});
+api.get('/:store', wrap(async (req, res) => {
+  res.json((await q(`SELECT * FROM "${req.params.store}" WHERE uid = $1 ORDER BY id`, [req.uid])).rows);
+}));
 
-api.get('/:store/:id', (req, res) => {
-  const s = req.params.store;
-  const row = db.prepare(`SELECT * FROM "${s}" WHERE id = ? AND uid = ?`).get(rowId(req), req.uid);
+api.get('/:store/:id', wrap(async (req, res) => {
+  const row = (await q(`SELECT * FROM "${req.params.store}" WHERE id = $1 AND uid = $2`, [rowId(req), req.uid])).rows[0];
   if (!row) throw httpErr(404, 'Not found.');
-  res.json(toClient(s, row));
-});
+  res.json(row);
+}));
 
-api.post('/:store', (req, res) => {
+api.post('/:store', wrap(async (req, res) => {
   const s = req.params.store, data = clean(s, req.body, false), cols = Object.keys(data);
-  const sql = `INSERT INTO "${s}" (uid${cols.map(c => `, "${c}"`).join('')}) VALUES (?${cols.map(() => ', ?').join('')})`;
-  const info = db.prepare(sql).run(req.uid, ...cols.map(c => data[c]));
-  res.status(201).json(toClient(s, db.prepare(`SELECT * FROM "${s}" WHERE id = ?`).get(info.lastInsertRowid)));
-});
+  const sql = `INSERT INTO "${s}" (uid${cols.map(c => `, "${c}"`).join('')}) VALUES ($1${cols.map((_, i) => `, $${i + 2}`).join('')}) RETURNING *`;
+  res.status(201).json((await q(sql, [req.uid, ...cols.map(c => data[c])])).rows[0]);
+}));
 
-api.put('/:store/:id', (req, res) => {
+api.put('/:store/:id', wrap(async (req, res) => {
   const s = req.params.store, id = rowId(req), data = clean(s, req.body, true), cols = Object.keys(data);
-  if (cols.length) {
-    const sql = `UPDATE "${s}" SET ${cols.map(c => `"${c}" = ?`).join(', ')} WHERE id = ? AND uid = ?`;
-    if (!db.prepare(sql).run(...cols.map(c => data[c]), id, req.uid).changes) throw httpErr(404, 'Not found.');
-  }
-  const row = db.prepare(`SELECT * FROM "${s}" WHERE id = ? AND uid = ?`).get(id, req.uid);
-  if (!row) throw httpErr(404, 'Not found.');
-  res.json(toClient(s, row));
-});
+  const result = cols.length
+    ? await q(`UPDATE "${s}" SET ${cols.map((c, i) => `"${c}" = $${i + 1}`).join(', ')} WHERE id = $${cols.length + 1} AND uid = $${cols.length + 2} RETURNING *`,
+              [...cols.map(c => data[c]), id, req.uid])
+    : await q(`SELECT * FROM "${s}" WHERE id = $1 AND uid = $2`, [id, req.uid]);
+  if (!result.rows[0]) throw httpErr(404, 'Not found.');
+  res.json(result.rows[0]);
+}));
 
-api.delete('/:store/:id', (req, res) => {
-  const s = req.params.store;
-  if (!db.prepare(`DELETE FROM "${s}" WHERE id = ? AND uid = ?`).run(rowId(req), req.uid).changes) throw httpErr(404, 'Not found.');
+api.delete('/:store/:id', wrap(async (req, res) => {
+  const r = await q(`DELETE FROM "${req.params.store}" WHERE id = $1 AND uid = $2`, [rowId(req), req.uid]);
+  if (!r.rowCount) throw httpErr(404, 'Not found.');
   res.json({ ok: true });
-});
+}));
 
 app.use('/api', api);
 app.use(express.static(path.join(__dirname, 'public')));
@@ -194,4 +186,6 @@ app.use((err, req, res, next) => {
   res.status(status).json({ error: status >= 500 ? 'Server error. Please try again.' : err.message });
 });
 
-app.listen(PORT, () => console.log(`Hayati running on http://localhost:${PORT}`));
+initDb()
+  .then(() => app.listen(PORT, () => console.log(`Hayati running on http://localhost:${PORT}`)))
+  .catch(e => { console.error('Could not set up the database:', e.message); process.exit(1); });
